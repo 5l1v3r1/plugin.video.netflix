@@ -2,6 +2,7 @@
 """
     Copyright (C) 2017 Sebastian Golasch (plugin.video.netflix)
     Copyright (C) 2018 Caphm (original implementation module)
+    Copyright (C) 2020 Stefano Gottardo
     Kodi library integration
 
     SPDX-License-Identifier: MIT
@@ -9,212 +10,279 @@
 """
 from __future__ import absolute_import, division, unicode_literals
 
-import os
-import random
-from functools import wraps
+from datetime import datetime
 
-import xbmc
+from future.utils import iteritems
 
+import resources.lib.api.api_requests as api
 import resources.lib.common as common
 import resources.lib.kodi.nfo as nfo
 import resources.lib.kodi.ui as ui
-from resources.lib.api.paths import PATH_REQUEST_SIZE_STD
+from resources.lib.database.db_utils import VidLibProp
 from resources.lib.globals import g
-from resources.lib.kodi.library_items import (export_item, remove_item, export_new_item, get_item,
-                                              ItemNotFound, FOLDER_MOVIES, FOLDER_TV, library_path)
-from resources.lib.kodi.library_tasks import compile_tasks, execute_tasks
+from resources.lib.kodi.library_tasks import LibraryTasks
+from resources.lib.kodi.library_utils import (request_kodi_library_upd, get_library_path,
+                                              FOLDER_NAME_MOVIES, FOLDER_NAME_SHOWS,
+                                              is_auto_update_library_running, request_kodi_library_upd_decorator)
+from resources.lib.navigation.directory_utils import delay_anti_ban
 
-try:  # Kodi >= 19
-    from xbmcvfs import makeLegalFilename  # pylint: disable=ungrouped-imports
-except ImportError:  # Kodi 18
-    from xbmc import makeLegalFilename  # pylint: disable=ungrouped-imports
+try:  # Python 2
+    unicode
+except NameError:  # Python 3
+    unicode = str  # pylint: disable=redefined-builtin
 
-
-def update_kodi_library(library_operation):
-    """Decorator that ensures an update of the Kodi library"""
-
-    @wraps(library_operation)
-    def kodi_library_update_wrapper(videoid, task_handler, *args, **kwargs):
-        """Either trigger an update of the Kodi library or remove the
-        items associated with videoid, depending on the invoked task_handler"""
-        is_remove = task_handler == [remove_item]
-        if is_remove:
-            _remove_from_kodi_library(videoid)
-        library_operation(videoid, task_handler, *args, **kwargs)
-        if not is_remove:
-            # Update Kodi library through service
-            # This prevents a second call to cancel the update
-            common.debug('Notify service to update the library')
-            common.send_signal(common.Signals.LIBRARY_UPDATE_REQUESTED)
-
-    return kodi_library_update_wrapper
+# Reasons that led to the creation of a class for the library operations:
+# - Time-consuming update functionality like "full sync of kodi library", "auto update", "export" (large tv show)
+#    from context menu or settings, can not be performed within of the service side or will cause IPC timeouts,
+#    and could block IPC access for other actions at same time.
+# - The scheduled update operations for the library require direct access to nfsession functions,
+#    otherwise if you use the IPC callback to access to nfsession will cause the continuous display
+#    of the loading screens while using Kodi, then to avoid the loading screen on update
+#    is needed run the whole code within the service side.
+# - Simple operations as "remove" can be executed directly without use of nfsession/IPC and speed up the operations.
+# A class allows you to choice to retrieve the data from netflix API through IPC or directly from nfsession.
 
 
-def list_contents(perpetual_range_start):
-    """Return a chunked list of all video IDs (movies, shows) contained in the library"""
-    perpetual_range_start = int(perpetual_range_start) if perpetual_range_start else 0
-    number_of_requests = 2
-    video_id_list = g.SHARED_DB.get_all_video_id_list()
-    count = 0
-    chunked_video_list = []
-    perpetual_range_selector = {}
-
-    for index, chunk in enumerate(common.chunked_list(video_id_list, PATH_REQUEST_SIZE_STD)):
-        if index >= perpetual_range_start:
-            if number_of_requests == 0:
-                if len(video_id_list) > count:
-                    # Exists others elements
-                    perpetual_range_selector['_perpetual_range_selector'] = {'next_start': perpetual_range_start + 1}
-                break
-            chunked_video_list.append(chunk)
-            number_of_requests -= 1
-        count += len(chunk)
-
-    if perpetual_range_start > 0:
-        previous_start = perpetual_range_start - 1
-        if '_perpetual_range_selector' in perpetual_range_selector:
-            perpetual_range_selector['_perpetual_range_selector']['previous_start'] = previous_start
-        else:
-            perpetual_range_selector['_perpetual_range_selector'] = {'previous_start': previous_start}
-    return chunked_video_list, perpetual_range_selector
-
-
-def is_in_library(videoid):
-    """Return True if the video is in the local Kodi library, else False"""
-    if videoid.mediatype == common.VideoId.MOVIE:
-        return g.SHARED_DB.movie_id_exists(videoid.value)
-    if videoid.mediatype == common.VideoId.SHOW:
-        return g.SHARED_DB.tvshow_id_exists(videoid.value)
-    if videoid.mediatype == common.VideoId.SEASON:
-        return g.SHARED_DB.season_id_exists(videoid.tvshowid,
-                                            videoid.seasonid)
-    if videoid.mediatype == common.VideoId.EPISODE:
-        return g.SHARED_DB.episode_id_exists(videoid.tvshowid,
-                                             videoid.seasonid,
-                                             videoid.episodeid)
-    raise common.InvalidVideoId('videoid {} type not implemented'.format(videoid))
-
-
-def export_new_episodes(videoid, silent=False, nfo_settings=None):
+def get_library_cls():
     """
-    Export new episodes for a tv show by it's video id
-    :param videoid: The videoid of the tv show to process
-    :param silent: don't display user interface while exporting
-    :param nfo_settings: the nfo settings
-    :return: None
+    Get the library class to do library operations
+    FUNCTION TO BE USED ONLY ON ADD-ON CLIENT INSTANCES
     """
+    # This build a instance of library class by assigning access to external functions through IPC
+    return Library(api.get_metadata, api.get_mylist_videoids_profile_switch)
 
-    method = execute_library_tasks_silently if silent else execute_library_tasks
 
-    if videoid.mediatype == common.VideoId.SHOW:
+class Library(LibraryTasks):
+    """Kodi library integration"""
+
+    def __init__(self, func_get_metadata, func_get_mylist_videoids_profile_switch):
+        super(Library, self).__init__()
+        # External functions
+        self.ext_func_get_metadata = func_get_metadata
+        self.ext_func_get_mylist_videoids_profile_switch = func_get_mylist_videoids_profile_switch
+
+    @request_kodi_library_upd_decorator
+    def export_to_library(self, videoid, show_prg_dialog=True):
+        """
+        Export an item to the Kodi library
+        :param videoid: the videoid
+        :param show_prg_dialog: if True show progress dialog, otherwise, a background progress bar
+        """
+        nfo_settings = nfo.NFOSettings()
+        nfo_settings.show_export_dialog(videoid.mediatype)
+        self.execute_library_tasks_gui(videoid,
+                                       [self.export_item],
+                                       title=common.get_local_string(30018),
+                                       nfo_settings=nfo_settings,
+                                       show_prg_dialog=show_prg_dialog)
+
+    @request_kodi_library_upd_decorator
+    def export_to_library_new_episodes(self, videoid, show_prg_dialog=True):
+        """
+        Export new episodes for a tv show by it's videoid
+        :param videoid: The videoid of the tv show to process
+        :param show_prg_dialog: if True show progress dialog, otherwise, a background progress bar
+        """
+        if videoid.mediatype != common.VideoId.SHOW:
+            common.debug('{} is not a tv show, no new episodes will be exported', videoid)
+            return
+        nfo_settings = nfo.NFOSettings()
+        nfo_settings.show_export_dialog(videoid.mediatype)
         common.debug('Exporting new episodes for {}', videoid)
-        method(videoid, [export_new_item],
-               title=common.get_local_string(30198),
-               nfo_settings=nfo_settings)
-    else:
-        common.debug('{} is not a tv show, no new episodes will be exported', videoid)
+        self.execute_library_tasks_gui(videoid,
+                                       [self.export_new_item],
+                                       title=common.get_local_string(30198),
+                                       nfo_settings=nfo_settings,
+                                       show_prg_dialog=show_prg_dialog)
 
+    @request_kodi_library_upd_decorator
+    def update_library(self, videoid, show_prg_dialog=True):
+        """
+        Update items in the Kodi library
+        :param videoid: the videoid
+        :param show_prg_dialog: if True show progress dialog, otherwise, a background progress bar
+        """
+        nfo_settings = nfo.NFOSettings()
+        nfo_settings.show_export_dialog(videoid.mediatype)
+        self.execute_library_tasks_gui(videoid,
+                                       [self.remove_item, self.export_item],
+                                       title=common.get_local_string(30061),
+                                       nfo_settings=nfo_settings,
+                                       show_prg_dialog=show_prg_dialog)
 
-@update_kodi_library
-def execute_library_tasks(videoid, task_handlers, title, nfo_settings=None):
-    """Execute library tasks for videoid and show errors in foreground"""
-    for task_handler in task_handlers:
-        execute_tasks(title=title,
-                      tasks=compile_tasks(videoid, task_handler, nfo_settings),
-                      task_handler=task_handler,
-                      notify_errors=True,
-                      library_home=library_path())
+    def remove_from_library(self, videoid, show_prg_dialog=True):
+        """
+        Remove an item from the Kodi library
+        :param videoid: the videoid
+        :param show_prg_dialog: if True show progress dialog, otherwise, a background progress bar
+        """
+        self.execute_library_tasks_gui(videoid,
+                                       [self.remove_item],
+                                       title=common.get_local_string(30030),
+                                       show_prg_dialog=show_prg_dialog)
 
+    def sync_library_with_mylist(self):
+        """
+        Perform a full sync of Kodi library with Netflix "My List",
+        by deleting everything that was previously exported
+        """
+        common.info('Performing sync of Kodi library with My list')
+        # Clear all the library
+        self.clear_library()
+        # Start the sync
+        self.auto_update_library(True, show_nfo_dialog=True, clear_on_cancel=True)
 
-@update_kodi_library
-def execute_library_tasks_silently(videoid, task_handlers, title=None, nfo_settings=None):
-    """Execute library tasks for videoid and don't show any GUI feedback"""
-    # pylint: disable=unused-argument
-    for task_handler in task_handlers:
-        for task in compile_tasks(videoid, task_handler, nfo_settings):
-            try:
-                task_handler(task, library_path())
-            except Exception:  # pylint: disable=broad-except
-                import traceback
-                common.error(g.py2_decode(traceback.format_exc(), 'latin-1'))
-                common.error('{} of {} failed', task_handler.__name__, task['title'])
+    @common.time_execution(immediate=True)
+    def clear_library(self, show_prg_dialog=True):
+        """
+        Delete all exported items to Kodi library, clean the add-on database, clean the folders
+        :param show_prg_dialog: if True, will be show a progress dialog window
+        """
+        common.info('Start deleting exported library items')
+        with ui.ProgressDialog(show_prg_dialog, common.get_local_string(30500), 3) as progress_dlg:
+            progress_dlg.perform_step()
+            progress_dlg.set_wait_message()
+            g.SHARED_DB.purge_library()
+            for folder_name in [FOLDER_NAME_MOVIES, FOLDER_NAME_SHOWS]:
+                progress_dlg.perform_step()
+                progress_dlg.set_wait_message()
+                section_root_dir = common.join_folders_paths(get_library_path(), folder_name)
+                common.delete_folder_contents(section_root_dir, delete_subfolders=True)
+        # Update Kodi library database
+        common.clean_library()
 
+    def auto_update_library(self, sync_with_mylist, show_prg_dialog=True, show_nfo_dialog=False, clear_on_cancel=False):
+        """
+        Perform an auto update of the exported items in to Kodi library.
+        - The main purpose is check if there are new seasons/episodes.
+        - In the case "Sync Kodi library with My list" feature is enabled, will be also synchronized with My List.
+        :param sync_with_mylist: if True, sync the Kodi library with Netflix My List
+        :param show_prg_dialog: if True, will be show a progress dialog window and the errors will be notified to user
+        :param show_nfo_dialog: if True, ask to user if want export NFO files (override custom NFO actions for videoid)
+        :param clear_on_cancel: if True, when cancel the operations will be cleared the entire library
+        """
+        if is_auto_update_library_running():
+            return
+        common.info('Start auto-updating of Kodi library {}',
+                    '(with sync of My List)' if sync_with_mylist else '')
+        g.SHARED_DB.set_value('library_auto_update_is_running', True)
+        g.SHARED_DB.set_value('library_auto_update_start_time', datetime.now())
+        try:
+            # Get the full list of the exported tvshows/movies as id (VideoId.value)
+            exp_tvshows_videoids_values = g.SHARED_DB.get_tvshows_id_list()
+            exp_movies_videoids_values = g.SHARED_DB.get_movies_id_list()
 
-def sync_mylist_to_library():
-    """
-    Perform a full sync of Netflix "My List" with the Kodi library
-    by deleting everything that was previously exported
-    """
-    common.info('Performing full sync of Netflix "My List" with the Kodi library')
-    purge()
-    nfo_settings = nfo.NFOSettings()
-    nfo_settings.show_export_dialog()
+            # Get the exported tvshows (to be updated) as dict (key=videoid, value=type of task)
+            videoids_tasks = {
+                common.VideoId.from_path([common.VideoId.SHOW, videoid_value]): self.export_new_item
+                for videoid_value in g.SHARED_DB.get_tvshows_id_list(VidLibProp['exclude_update'], False)
+            }
 
-    mylist_video_id_list, mylist_video_id_list_type = common.make_call('get_mylist_videoids_profile_switch')
-    for index, video_id in enumerate(mylist_video_id_list):
-        videoid = common.VideoId(
-            **{('movieid' if (mylist_video_id_list_type[index] == 'movie') else 'tvshowid'): video_id})
-        execute_library_tasks(videoid, [export_item],
-                              common.get_local_string(30018),
-                              nfo_settings=nfo_settings)
-        # Add some randomness between operations to limit servers load and ban risks
-        xbmc.sleep(random.randint(1000, 3001))
+            if sync_with_mylist:
+                # Get My List videoids of the chosen profile
+                # pylint: disable=not-callable
+                mylist_video_id_list, mylist_video_id_list_type = self.ext_func_get_mylist_videoids_profile_switch()
 
+                # Check if tv shows have been removed from the My List
+                for videoid_value in exp_tvshows_videoids_values:
+                    if unicode(videoid_value) in mylist_video_id_list:
+                        continue
+                    # The tv show no more exist in My List so remove it from library
+                    videoid = common.VideoId.from_path([common.VideoId.SHOW, videoid_value])
+                    videoids_tasks.update({videoid: self.remove_item})
 
-@common.time_execution(immediate=False)
-def purge():
-    """Purge all items exported to Kodi library and delete internal library database"""
-    common.info('Purging internal database and kodi library')
-    for videoid_value in g.SHARED_DB.get_movies_id_list():
-        videoid = common.VideoId.from_path([common.VideoId.MOVIE, videoid_value])
-        execute_library_tasks(videoid, [remove_item],
-                              common.get_local_string(30030))
-    for videoid_value in g.SHARED_DB.get_tvshows_id_list():
-        videoid = common.VideoId.from_path([common.VideoId.SHOW, videoid_value])
-        execute_library_tasks(videoid, [remove_item],
-                              common.get_local_string(30030))
-    # If for some reason such as improper use of the add-on, unexpected error or other
-    # has caused inconsistencies with the contents of the database or stored files,
-    # make sure that everything is removed
-    g.SHARED_DB.purge_library()
-    for folder_name in [FOLDER_MOVIES, FOLDER_TV]:
-        section_dir = xbmc.translatePath(
-            makeLegalFilename('/'.join([library_path(), folder_name])))
-        common.delete_folder_contents(section_dir, delete_subfolders=True)
+                # Check if movies have been removed from the My List
+                for videoid_value in exp_movies_videoids_values:
+                    if unicode(videoid_value) in mylist_video_id_list:
+                        continue
+                    # The movie no more exist in My List so remove it from library
+                    videoid = common.VideoId.from_path([common.VideoId.MOVIE, videoid_value])
+                    videoids_tasks.update({videoid: self.remove_item})
 
+                # Add to library the missing tv shows / movies of My List
+                for index, videoid_value in enumerate(mylist_video_id_list):
+                    if (int(videoid_value) not in exp_tvshows_videoids_values and
+                            int(videoid_value) not in exp_movies_videoids_values):
+                        is_movie = mylist_video_id_list_type[index] == 'movie'
+                        videoid = common.VideoId(**{('movieid' if is_movie else 'tvshowid'): videoid_value})
+                        videoids_tasks.update({videoid: self.export_new_item if is_movie else self.export_item})
 
-def _remove_from_kodi_library(videoid):
-    """Remove an item from the Kodi library."""
-    common.info('Removing {} videoid from Kodi library', videoid)
-    try:
-        kodi_library_items = [get_item(videoid)]
-        if videoid.mediatype == common.VideoId.SHOW or videoid.mediatype == common.VideoId.SEASON:
-            # Retrieve the all episodes in the export folder
-            filters = {'and': [
-                {'field': 'path', 'operator': 'startswith',
-                 'value': os.path.dirname(kodi_library_items[0]['file'])},
-                {'field': 'filename', 'operator': 'endswith', 'value': '.strm'}
-            ]}
-            if videoid.mediatype == common.VideoId.SEASON:
-                # Add a season filter in case we just want to remove a season
-                filters['and'].append({'field': 'season', 'operator': 'is',
-                                       'value': str(kodi_library_items[0]['season'])})
-            kodi_library_items = common.get_library_items(common.VideoId.EPISODE, filters)
-        for item in kodi_library_items:
-            rpc_params = {
-                'movie': ['VideoLibrary.RemoveMovie', 'movieid'],
-                # We should never remove an entire show
-                # 'show': ['VideoLibrary.RemoveTVShow', 'tvshowid'],
-                # Instead we delete all episodes listed in the JSON query above
-                'show': ['VideoLibrary.RemoveEpisode', 'episodeid'],
-                'season': ['VideoLibrary.RemoveEpisode', 'episodeid'],
-                'episode': ['VideoLibrary.RemoveEpisode', 'episodeid']
-            }[videoid.mediatype]
-            common.debug(item)
-            common.json_rpc(rpc_params[0],
-                            {rpc_params[1]: item[rpc_params[1]]})
-    except ItemNotFound:
-        common.warn('Cannot remove {} from Kodi library, item not present', videoid)
-    except KeyError as exc:
-        ui.show_notification(common.get_local_string(30120), time=7500)
-        common.warn('Cannot remove {} from Kodi library, Kodi does not support this (yet)', exc)
+            # Start the update operations
+            ret = self._update_library(videoids_tasks, exp_tvshows_videoids_values, show_prg_dialog, show_nfo_dialog,
+                                       clear_on_cancel)
+            g.SHARED_DB.set_value('library_auto_update_is_running', False)
+            if not ret:
+                common.warn('Auto update of the Kodi library interrupted')
+                return
+            request_kodi_library_upd()
+            common.info('Auto update of the Kodi library completed')
+            if not g.ADDON.getSettingBool('lib_auto_upd_disable_notification'):
+                ui.show_notification(common.get_local_string(30220), time=5000)
+        except Exception as exc:  # pylint: disable=broad-except
+            import traceback
+            common.error('An error has occurred in the library auto update: {}', exc)
+            common.error(g.py2_decode(traceback.format_exc(), 'latin-1'))
+            g.SHARED_DB.set_value('library_auto_update_is_running', False)
+
+    def _update_library(self, videoids_tasks, exp_tvshows_videoids_values, show_prg_dialog, show_nfo_dialog,
+                        clear_on_cancel):
+        # If set ask to user if want to export NFO files (override user custom NFO settings for videoids)
+        nfo_settings_override = None
+        if show_nfo_dialog:
+            nfo_settings_override = nfo.NFOSettings()
+            nfo_settings_override.show_export_dialog()
+        # Get the exported tvshows, but to be excluded from the updates
+        excluded_videoids_values = g.SHARED_DB.get_tvshows_id_list(VidLibProp['exclude_update'], True)
+        # Start the update operations
+        with ui.ProgressDialog(show_prg_dialog, max_value=len(videoids_tasks)) as progress_bar:
+            for videoid, task_handler in iteritems(videoids_tasks):
+                # Check if current videoid is excluded from updates
+                if int(videoid.value) in excluded_videoids_values:
+                    continue
+                # Get the NFO settings for the current videoid
+                if not nfo_settings_override and int(videoid.value) in exp_tvshows_videoids_values:
+                    # User custom NFO setting
+                    # it is possible that the user has chosen not to export NFO files for a specific tv show
+                    nfo_export = g.SHARED_DB.get_tvshow_property(videoid.value,
+                                                                 VidLibProp['nfo_export'], False)
+                    nfo_settings = nfo.NFOSettings(nfo_export)
+                else:
+                    nfo_settings = nfo_settings_override or nfo.NFOSettings()
+                # Execute the task
+                for index, total_tasks, title in self.execute_library_tasks(videoid,
+                                                                            [task_handler],
+                                                                            nfo_settings=nfo_settings,
+                                                                            notify_errors=show_prg_dialog):
+                    label_partial_op = ' ({}/{})'.format(index + 1, total_tasks) if total_tasks > 1 else ''
+                    progress_bar.set_message(title + label_partial_op)
+                if progress_bar.iscanceled():
+                    if clear_on_cancel:
+                        self.clear_library(show_prg_dialog)
+                        return False
+                if self.is_abort_requested:
+                    return False
+                progress_bar.perform_step()
+                progress_bar.set_wait_message()
+                delay_anti_ban()
+        return True
+
+    def import_library(self, is_old_format):
+        """
+        Imports an already existing library into the add-on library database,
+        allows you to recover an existing library, avoiding to recreate it from scratch.
+        :param is_old_format: if True, imports library items with old format version (add-on version 13.x)
+        """
+        nfo_settings = nfo.NFOSettings()
+        if is_old_format:
+            # TODO-------------------------------------------------------------------------------------------------------
+            # for videoid in self.imports_videoids_from_existing_old_library():
+            #     self.execute_library_tasks(videoid,
+            #                                [self.export_item],
+            #                                nfo_settings=nfo_settings,
+            #                                title=common.get_local_string(30018))
+            if self.is_abort_requested:
+                common.warn('Import library interrupted by Kodi')
+                return
+            # Here delay_anti_ban is not needed metadata are already cached
+        else:
+            raise NotImplementedError

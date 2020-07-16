@@ -36,7 +36,7 @@ class Signals(object):  # pylint: disable=no-init
     PLAYBACK_INITIATED = 'playback_initiated'
     ESN_CHANGED = 'esn_changed'
     RELEASE_LICENSE = 'release_license'
-    LIBRARY_UPDATE_REQUESTED = 'library_update_requested'
+    REQUEST_KODI_LIBRARY_UPDATE = 'request_kodi_library_update'
     UPNEXT_ADDON_INIT = 'upnext_data'
     QUEUE_VIDEO_EVENT = 'queue_video_event'
     CLEAR_USER_ID_TOKENS = 'clean_user_id_tokens'
@@ -171,8 +171,6 @@ def _raise_for_error(callname, result):
     if isinstance(result, dict) and IPC_EXCEPTION_PLACEHOLDER in result:
         result = result[IPC_EXCEPTION_PLACEHOLDER]
         try:
-            if not result['class'] == 'CacheMiss':
-                error('IPC call {callname} returned {class}: {message}'.format(callname=callname, **result))
             raise apierrors.__dict__[result['class']](result['message'])
         except KeyError:
             raise Exception(result['class'] + '\r\nError details:\r\n' + result.get('message', '--'))
@@ -204,9 +202,10 @@ def _perform_ipc_return_call_instance(instance, func, data):
     try:
         result = _call_with_instance(instance, func, data)
     except Exception as exc:  # pylint: disable=broad-except
-        error('IPC callback raised exception: {exc}', exc=exc)
-        import traceback
-        error(g.py2_decode(traceback.format_exc(), 'latin-1'))
+        if exc.__class__.__name__ not in ['CacheMiss', 'MetadataNotAvailable']:
+            error('IPC callback raised exception: {exc}', exc=exc)
+            import traceback
+            error(g.py2_decode(traceback.format_exc(), 'latin-1'))
         result = ipc_convert_exc_to_json(exc)
     return _execute_addonsignals_return_call(result, func.__name__)
 
@@ -215,9 +214,10 @@ def _perform_ipc_return_call(func, data, func_name=None):
     try:
         result = _call(func, data)
     except Exception as exc:  # pylint: disable=broad-except
-        error('IPC callback raised exception: {exc}', exc=exc)
-        import traceback
-        error(g.py2_decode(traceback.format_exc(), 'latin-1'))
+        if exc.__class__.__name__ not in ['CacheMiss', 'MetadataNotAvailable']:
+            error('IPC callback raised exception: {exc}', exc=exc)
+            import traceback
+            error(g.py2_decode(traceback.format_exc(), 'latin-1'))
         result = ipc_convert_exc_to_json(exc)
     return _execute_addonsignals_return_call(result, func_name)
 

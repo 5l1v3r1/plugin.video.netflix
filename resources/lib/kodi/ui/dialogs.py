@@ -144,3 +144,71 @@ def show_dlg_select(title, item_list):
     :return index of selected item, or -1 when cancelled
     """
     return xbmcgui.Dialog().select(title, item_list)
+
+
+class ProgressDialog(xbmcgui.DialogProgress):
+    """Context manager to handle a progress dialog window"""
+    # Keep the same arguments for all progress bar classes
+    def __init__(self, is_enabled, title=None, max_value=1):
+        xbmcgui.DialogProgress.__init__(self)
+        self.is_enabled = is_enabled
+        self.max_value = max_value
+        self.value = 0
+        self._percent = 0
+        if is_enabled:
+            self.create(title or common.get_local_string(30047))
+
+    def __enter__(self):
+        if self.is_enabled:
+            self.update(0, common.get_local_string(261))  # "Waiting for start..."
+        return self
+
+    def set_message(self, message):
+        if self.is_enabled:
+            self.update(self._percent, message)
+
+    def set_wait_message(self):
+        if self.is_enabled:
+            self.update(self._percent, common.get_local_string(20186))  # "Please wait"
+
+    def perform_step(self):
+        self.value += 1
+        self._percent = int(self.value * 100 / self.max_value)
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        if self.is_enabled:
+            self.close()
+
+
+class ProgressBarBG(xbmcgui.DialogProgressBG):
+    """Context manager to handle a progress bar in background"""
+    # Keep the same arguments for all progress bar classes
+    def __init__(self, is_enabled, title, max_value=1):
+        xbmcgui.DialogProgressBG.__init__(self)
+        self.is_enabled = is_enabled
+        self.max_value = max_value
+        self.value = 0
+        self._percent = 0
+        if is_enabled:
+            self.create(title)
+
+    def __enter__(self):
+        if self.is_enabled:
+            self.update(0, common.get_local_string(261))  # "Waiting for start..."
+        return self
+
+    def set_message(self, message):
+        if self.is_enabled:
+            self.update(self._percent, message)
+
+    def set_wait_message(self):
+        if self.is_enabled:
+            self.update(self._percent, common.get_local_string(20186))  # "Please wait"
+
+    def perform_step(self):
+        self.value += 1
+        self._percent = int(self.value * 100 / self.max_value)
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        if self.is_enabled:
+            self.close()

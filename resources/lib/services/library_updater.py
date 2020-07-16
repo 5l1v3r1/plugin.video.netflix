@@ -11,18 +11,10 @@ from __future__ import absolute_import, division, unicode_literals
 
 from datetime import datetime, timedelta
 
-import AddonSignals
 import xbmc
 
 from resources.lib.globals import g
 import resources.lib.common as common
-import resources.lib.kodi.library as kodi_library
-from resources.lib.kodi.library_autoupdate import auto_update_library
-
-try:  # Kodi >= 19
-    from xbmcvfs import makeLegalFilename  # pylint: disable=ungrouped-imports
-except ImportError:  # Kodi 18
-    from xbmc import makeLegalFilename  # pylint: disable=ungrouped-imports
 
 
 class LibraryUpdateService(xbmc.Monitor):
@@ -31,6 +23,7 @@ class LibraryUpdateService(xbmc.Monitor):
     """
 
     def __init__(self):
+        xbmc.Monitor.__init__(self)
         try:
             self.enabled = g.ADDON.getSettingInt('lib_auto_upd_mode') == 2
         except Exception:  # pylint: disable=broad-except
@@ -39,17 +32,8 @@ class LibraryUpdateService(xbmc.Monitor):
             # If any other error appears, we don't want the service to crash,
             # let's return None in all case
             self.enabled = False
-
         self.startidle = 0
         self.next_schedule = _compute_next_schedule()
-
-        # Update library variables
-        xbmc.Monitor.__init__(self)
-        self.scan_in_progress = False
-        self.scan_awaiting = False
-        AddonSignals.registerSlot(
-            g.ADDON.getAddonInfo('id'), common.Signals.LIBRARY_UPDATE_REQUESTED,
-            self.update_kodi_library)
 
     def on_service_tick(self):
         """Check if update is due and trigger it"""
@@ -59,9 +43,9 @@ class LibraryUpdateService(xbmc.Monitor):
                 and self.next_schedule <= datetime.now()
                 and self.is_idle()):
             common.debug('Triggering auto update library')
-
-            common.run_threaded(True, auto_update_library, g.ADDON.getSettingBool('lib_sync_mylist'), True)
-
+            # Send signal to nfsession to run the library auto update
+            common.send_signal('library_auto_update')
+            # Set as started
             g.SHARED_DB.set_value('library_auto_update_last_start', datetime.now())
             self.next_schedule = _compute_next_schedule()
 
@@ -92,36 +76,6 @@ class LibraryUpdateService(xbmc.Monitor):
         # Then compute the next schedule
         if self.enabled:
             self.next_schedule = _compute_next_schedule()
-
-    def onScanStarted(self, library):
-        """Monitor library scan to avoid multiple calls"""
-        # Kodi cancels the update if called with JSON RPC twice
-        # so we monitor events to ensure we're not cancelling a previous scan
-        if library == 'video':
-            self.scan_in_progress = True
-
-    def onScanFinished(self, library):
-        """Monitor library scan to avoid multiple calls"""
-        # Kodi cancels the update if called with JSON RPC twice
-        # so we monitor events to ensure we're not cancelling a previous scan
-        if library == 'video':
-            self.scan_in_progress = False
-            if self.scan_awaiting:
-                common.debug('Kodi library update requested from library auto-update (from awaiting)')
-                self.update_kodi_library()
-
-    def update_kodi_library(self, data=None):  # pylint: disable=unused-argument
-        # Update only the elements in the addon export folder for faster processing with a large library (on Kodi 18.x)
-        # If a scan is already in progress, the scan is delayed until onScanFinished event
-        if not self.scan_in_progress:
-            common.debug('Kodi library update requested from library auto-update')
-            self.scan_awaiting = False
-            common.scan_library(
-                makeLegalFilename(
-                    xbmc.translatePath(
-                        kodi_library.library_path())))
-        else:
-            self.scan_awaiting = True
 
 
 def _compute_next_schedule():
